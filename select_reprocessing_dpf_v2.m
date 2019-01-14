@@ -1,11 +1,19 @@
-function status = select_reprocessing_dpf_v2(filename_evt)
+function status = select_reprocessing_dpf_v2(filename_evt , filename_rq)
+%Inputs evt file
+% rq.mat file - not the rq binary files
+%the rq.mat file should have alredy been processed with 100 pulses
 
+if contains(filename_rq , '.mat')
+    filename_rq = erase(filename_rq, '.mat')
+end
 addpath(genpath(['~/LUXcode/Stable_Releases/v2.0/DataProcessing']));
-pathbase= '/home/paul/LUXdata'
+%pathbase= '/home/paul/LUXdata'
+pathbase = '/media/paul/TOSHIBA/Test_evt/'
 
 filename_prefix=filename_evt(1:19); %looking at rq file 
-data_path_evt = [pathbase filesep filename_prefix filesep];
-filename_rq = strrep(filename_evt,'evt','rq');
+%data_path_evt = [pathbase filesep filename_prefix filesep];
+data_path_evt = [pathbase filesep];
+%filename_rq = strrep(filename_evt,'evt','rq');
 data_path_rq = [pathbase filesep];
 
 lug_iqs_xml_file = '~/MATLAB/lug_iqs_new4.xml'
@@ -18,7 +26,9 @@ data_processing_xml_path =data_processing_settings_path;
 %to handle a speific rq file. ?
 
 %dp = LUXLoadRQ1s_framework(filename_rq, data_path_rq);
-dp = load([data_path_rq '/matfiles/' filename_rq '.mat']);
+%dp = load([data_path_rq '/matfiles/' filename_rq '.mat']);
+dp = load([data_path_rq '/matfiles/' filename_rq '.mat' ]);
+
 
 settings.evt_settings = dp.admin.evt_settings;
 settings.daq_settings = dp.admin.daq_settings;
@@ -60,14 +70,18 @@ min_pulse_area = 1000; %phd this is the minimum area required to say that this i
 is_long_pulse = dp.pulse_length_samples > minimum_sample_length;
 re_process = find(sum(is_long_pulse));
 
-if ~isempty(re_process) % a pulse in event is long
-    %first step in the dpf
-    system(['/home/paul/LUXcode/Stable_Releases/v2.0/DataProcessing/CppModules/bin/InitializeRQFile_Initialize ' filename_evt ' ' data_path_evt ' ' filename_rq ' ' pathbase ' 1 ' data_processing_settings_path ' ' lug_iqs_xml_file ])
+if ~isempty(re_process) % an event has a pulse that is long
     
-    %% chop the evt file 
     event_struct = LUXEventLoader_framework(data_path_evt, filename_evt);
+
+    chop_filename_rq = strrep(filename_rq , '.rq' , '_chop.rq');
+    %first step in the dpf
+    %system(['/home/paul/LUXcode/Stable_Releases/v2.0/DataProcessing/CppModules/bin/InitializeRQFile_Initialize ' filename_evt ' ' data_path_evt ' ' filename_rq ' ' pathbase ' 1 ' data_processing_settings_path ' ' lug_iqs_xml_file ])
+    %don't need? since we are starting from existing rq file
+    
+    %% chop down the evt file 
     evt_list = fieldnames(event_struct);
-    clear new_evt        
+    clear new_evt_file       
     N_new = length(re_process);
     for i = 1:length(evt_list)
         current_evt = evt_list{i};
@@ -103,28 +117,155 @@ if ~isempty(re_process) % a pulse in event is long
         end
     end % evt_list
 
+    %% now we want to run another pass at the evt info to see what else we
+    % can eliminate. First generate a cvt like object
+    %this is like the baseline zen
+    amp_gain = dp.admin.daq_settings.global.preamp .* dp.admin.daq_settings.global.postamp;
+
+    % Figure out which iq has the pmt_gains - assuming only ONE iq was returned
+    % for each type
+    pmt_gains_mVns_per_phe = [];
+
+    for ii = 1:length(lug_iqs_xml.iq)
+        if isfield(lug_iqs_xml,'iq') && isfield(lug_iqs_xml.iq(ii),'global') && isfield(lug_iqs_xml.iq(ii).global,'iq_type')
+            if strcmp(lug_iqs_xml.iq(ii).global.iq_type,'pmt_gains') == 1
+                pmt_gains_mVns_per_phe = [lug_iqs_xml.iq(ii).fit.channel.mVns_per_phe];
+             break
+            end
+        end
+    end
+
+    myname = 'PulseCalibration_BaselineZen';
+
+    module_names = {dp_settings_xml.data_processing_settings.module.module_name};
+    index_temp = strfind(module_names,myname);
+    index_module = find(not(cellfun('isempty', index_temp)));
+
+    if ~isempty(index_module)
+        dp_settings_xml.data_processing_settings.module(index_module);
+        mymodule_settings = dp_settings_xml.data_processing_settings.module(index_module).parameters;
+    else
+    %     error(sprintf('*** ERROR: Module was not found in settings file:\n%s\n',data_processing_xml_path));
+    end
+
+    holder = new_evt_file;% do this to the reduced evt struct.
+    holder(1).thr = mymodule_settings.flatten_thr; % simple way to port this value into the function
+    holder =  LUXCalibratePulses_framework(holder,pmt_gains_mVns_per_phe,amp_gain);
+    cvt_struct = LUXSumPOD_framework(holder); %this is instead of the pod summing module
+    clear holder;
+
+    final_ind = 1;
+    clear final_evt_new;
+    
+    
+    for p = 1:length(re_process) % still need these numbers because we are also looking at the rq file
+        event = re_process(p);
+        long_pulses = find(dp.pulse_length_samples(:,event)>4000);
+        first_long_pulse = long_pulses(1);
+        pulse_start = dp.pulse_start_samples(first_long_pulse, event);
+        pulse_end = dp.pulse_end_samples(first_long_pulse, event);
+
+        if dp.pulse_length_samples(first_long_pulse, event) > 32000
+            pps_test_mid = pulse_start + 16000;
+            pps_test_end = pulse_start + 31500;
+        else
+            pps_test_mid = pulse_start + (pulse_end - pulse_start)/2;
+            pps_test_end = pulse_end - 500; % back off a bit from the exact end since this will be going toward zero
+        end
+
+
+        [~ , mid_location_start ] = min( abs(cvt_struct(p).sumpod_time_samples - double(pps_test_mid - 25)  ) );
+        [~ , mid_location_end ] = min( abs(cvt_struct(p).sumpod_time_samples - double(pps_test_mid + 25)  ) );
+
+        [~ , end_location_start ] = min( abs(cvt_struct(p).sumpod_time_samples - double(pps_test_end - 25)  ) );
+        [~ , end_location_end ] = min( abs(cvt_struct(p).sumpod_time_samples - double(pps_test_end + 25)  ) );
+
+        pps_mid_ave = sum(cvt_struct(p).sumpod_data_phe_per_sample(mid_location_start:mid_location_end)) ...
+                         / (mid_location_end - mid_location_start);
+        pps_end_ave = sum(cvt_struct(p).sumpod_data_phe_per_sample(end_location_start:end_location_end)) ...
+                         / (end_location_end - end_location_start);
+
+        pps_threshold = 5; %phd per sample required to keep the pulse
+
+        if pps_end_ave > pps_threshold && pps_mid_ave > pps_threshold 
+            % if both are above threshold then we keep the pulse
+            final_evt_new(final_ind) = new_evt_file(p);
+            new_cvt_file(final_ind) = cvt_struct(p);
+            final_re_process(final_ind) = re_process(p);
+            final_ind = final_ind + 1;
+        end
+    'hello'
+    end
+    clear new_evt_file; %don't need this, we have final_evt_new and event_struct
+          
+    if final_ind == 1 % there has been no entry to the final structs.
+        return;
+    end
+    
+    evt_list = fieldnames(event_struct);          
+    for j = 1: length(evt_list)
+        current_evt = evt_list{j};
+    
+        if strcmp(current_evt, 'ch_map')
+            final_evt_new(1).(current_evt) = event_struct(:,1).(current_evt);
+        elseif strcmp(current_evt, 'filename')
+            filename_evt_new = [filename_evt(1:end-4) '_chop.evt'];
+            final_evt_new(1).(current_evt) = filename_evt_new;
+        elseif  strcmp(current_evt, 'filename_prefix') ||...
+                strcmp(current_evt, 'posttrigger') || strcmp(current_evt, 'pretrigger')
+                    
+            final_evt_new(1).(current_evt) = event_struct(:,1).(current_evt);
+            final_evt_new(end).(current_evt) = event_struct(:,end).(current_evt);
+        end
+    end
+
+    N_new = length(final_evt_new);
+
     %save the new file
     fprintf('Saving EVT file... ');
     filename_evt_fullpath_new = [data_path_evt filesep filename_evt_new '.mat'];
-    save(filename_evt_fullpath_new, 'new_evt_file');
+    save(filename_evt_fullpath_new, 'final_evt_new' , '-v7.3');
     chop_filename_evt = filename_evt_new;
-    clear new_evt event_struct;
+    clear final_evt_new event_struct; % we are done with these, save the RAM
+    
+    cvt_list = fieldnames(cvt_struct);
+
+    for jj = 1: length(cvt_list)
+        current_cvt = cvt_list{jj};
+    
+        if strcmp(current_cvt, 'ch_map')
+            new_cvt_file(1).(current_cvt) = cvt_struct(:,1).(current_cvt);
+
+        elseif  strcmp(current_cvt, 'filename_prefix') ||...
+                strcmp(current_cvt, 'posttrigger') || strcmp(current_cvt, 'pretrigger')
+                    
+            new_cvt_file(1).(current_cvt) = cvt_struct(:,1).(current_cvt);
+            new_cvt_file(end).(current_cvt) = cvt_struct(:,end).(current_cvt);
+        end
+    end
+
+
+    %save the new file
+    fprintf('Saving CVT file... ');
+    chop_filename_cvt = strrep(filename_evt , '.evt' , '_chop.cvt');
+    filename_cvt_fullpath_new = [data_path_evt filesep chop_filename_cvt];
+ 
+    status = LUXCVTWriter_framework( new_cvt_file, settings, livetime, filename_cvt_fullpath_new );
+    clear new_cvt cvt_struct;
     
     dp_chop.admin = dp.admin;
-    dp_chop.file_number =  dp.file_number(re_process);
-    dp_chop.event_number = dp.event_number(re_process);
+    dp_chop.file_number =  dp.file_number(final_re_process);
+    dp_chop.event_number = dp.event_number(final_re_process);
     dp_chop.source_filename = dp.source_filename;
-    dp_chop.event_timestamp_samples = dp.event_timestamp_samples(re_process);
-    dp_chop.luxstamp_samples = dp.luxstamp_samples(re_process);
-    dp_chop.time_since_livetime_start_samples = dp.time_since_livetime_start_samples(re_process);
-    dp_chop.time_until_livetime_end_samples = dp.time_until_livetime_end_samples(re_process);
-             
-    chop_filename_rq = strrep(filename_rq , '.rq' , '_chop.rq');
+    dp_chop.event_timestamp_samples = dp.event_timestamp_samples(final_re_process);
+    dp_chop.luxstamp_samples = dp.luxstamp_samples(final_re_process);
+    dp_chop.time_since_livetime_start_samples = dp.time_since_livetime_start_samples(final_re_process);
+    dp_chop.time_until_livetime_end_samples = dp.time_until_livetime_end_samples(final_re_process);
  
-    status = LUXBinaryRQWriter_framework(settings, dp_chop, chop_filename_rq, data_path_rq, re_process, livetime);
-    
-    status = PulseCalibration_BaselineZen_split_sim(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_settings_path,lug_iqs_xml_file);
-    status = PODSummer_LUXSumPOD(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_settings_path,lug_iqs_xml_file);
+
+    %don't need these anymore
+ %   status = PulseCalibration_BaselineZen_split_sim(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_settings_path,lug_iqs_xml_file);
+  %  status = PODSummer_LUXSumPOD(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_settings_path,lug_iqs_xml_file);
 
     %% Section in place of Transparent Rubix Cube
     % look at the finalized non-chop result
@@ -138,7 +279,7 @@ if ~isempty(re_process) % a pulse in event is long
 
     
     for new_evt = 1: N_new %this is to count the event number in the reduced evt
-        evt = re_process(new_evt); % only go through events that need reprocessing
+        evt = final_re_process(new_evt); % only go through events that need reprocessing
        
         large_pulse = find(dp.pulse_area_phe(:, evt) > min_pulse_area);   %find first large pulse 
         first_large_pulse = large_pulse(1);  
@@ -170,9 +311,9 @@ if ~isempty(re_process) % a pulse in event is long
     new_num_pulses_found = uint32(sum(new_index_kept_sumpods==1));% this will help visualux
    
     %{
-    dp_chop.adc_ppe = dp.adc_ppe(re_process);
-    dp_chop.adc_sds = dp.adc_sds(re_process);
-    dp_chop.zen_applied = dp.zen_applied(re_process);
+    dp_chop.adc_ppe = dp.adc_ppe(final_re_process);
+    dp_chop.adc_sds = dp.adc_sds(final_re_process);
+    dp_chop.zen_applied = dp.zen_applied(final_re_process);
     if isfield(dp, 'livetime_latch_samples')
         dp_chop.livetime_latch_samples = dp.livetime_latch_samples;
     end
@@ -188,51 +329,9 @@ if ~isempty(re_process) % a pulse in event is long
     %now that we have this info let's save it
 
  
-    status = LUXBinaryRQWriter_framework(settings, dp_chop, chop_filename_rq, data_path_rq, re_process, livetime);
+    status = LUXBinaryRQWriter_framework(settings, dp_chop, chop_filename_rq, data_path_rq, final_re_process, livetime);
     clear dp_chop; 
-%{    
-    %% now get the required cvt info
-    filename_cvt = strrep(filename_evt,'evt','cvt');
-    [cvt_struct settings] = LUXCVTLoader_framework(data_path_evt, filename_cvt);
 
-    cvt_list = fieldnames(cvt_struct);
-    clear new_cvt;
-    for i = 1:length(cvt_list)
-        current_cvt = cvt_list{i};
-
-        for j = 1:ending % go through each event reprocessed event
-            current_event = re_process(j);
-  
-            if j==1
-                if strcmp(current_cvt, 'ch_map') || strcmp(current_cvt, 'filename_prefix') ||...
-                    strcmp(current_cvt, 'posttrigger') || strcmp(current_cvt, 'pretrigger')
-            
-                    new_cvt(j).(current_cvt) = cvt_struct(:, 1).(current_cvt);
-                else
-                    new_cvt(j).(current_cvt) = cvt_struct(:,current_event).(current_cvt); 
-                end
-            elseif j == ending
-                if  strcmp(current_cvt, 'filename_prefix') ||...
-                    strcmp(current_cvt, 'posttrigger') || strcmp(current_cvt, 'pretrigger')
-                    
-                    new_cvt(j).(current_cvt) = cvt_struct(:, end).(current_cvt);
-                else
-                    new_cvt(j).(current_cvt) = cvt_struct(:, current_event).(current_cvt); 
-                end    
-            else 
-            new_cvt(j).(current_cvt) = cvt_struct(:, current_event).(current_cvt); 
-            end% j not 1 or end
-        end %event list
-    end % cvt_list
-
-    %save the new file
-    fprintf('Saving CVT file... ');
-    chop_filename_cvt = strrep(filename_cvt , '.cvt' , '_chop.cvt');
-    filename_cvt_fullpath_new = [data_path_evt filesep chop_filename_cvt];
- 
-    status = LUXCVTWriter_framework( new_cvt, settings, livetime, filename_cvt_fullpath_new );
-    clear new_cvt cvt_struct;
-%}
     system(['/home/paul/LUXcode/Stable_Releases/v2.0/DataProcessing/CppModules/bin/PulseTiming_HeightTiming ' chop_filename_evt ' ' data_path_evt ' ' chop_filename_rq ' ' pathbase ' 5 ' data_processing_settings_path ' ' lug_iqs_xml_file ]);
 
     status = PulseQuantities_MinimumSet_split_sim(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_xml_path,iq_xml_path);
@@ -246,7 +345,7 @@ if ~isempty(re_process) % a pulse in event is long
     status = PulseQuantities_TimeSince(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_xml_path,iq_xml_path); %deals with etrains, and looks at the time since the last 'big' event
     status = AdditionalFileFormat_SaveMatFile(chop_filename_evt,data_path_evt,chop_filename_rq,data_path_rq,data_processing_xml_path,iq_xml_path);
         
-    %now the dp_chop is sreaved as a .mat file
+    %now the dp_chop is saved as a .mat file
     dp_chop = load([data_path_rq '/matfiles/' chop_filename_rq '.mat']);
     %dp_reg = LUXLoadRQ1s_framework(filename_rq, data_path_rq);
     dp = post_dpf_corrections(filename_evt , dp);
@@ -262,14 +361,14 @@ if ~isempty(re_process) % a pulse in event is long
                 || ~isfield(dp_chop, current_field)
             continue
         elseif ndims(dp_combined.(current_field))>2
-            dp_combined.(current_field)(:, :, re_process) = dp_chop.(current_field);
+            dp_combined.(current_field)(:, :, final_re_process) = dp_chop.(current_field);
         else
-            dp_combined.(current_field)(:, re_process) = dp_chop.(current_field);
+            dp_combined.(current_field)(:, final_re_process) = dp_chop.(current_field);
         end
     end
     
     dp_combined.chopped_flag = zeros(1, length(dp_combined.file_number));
-    dp_combined.chopped_flag(re_process) = 1;
+    dp_combined.chopped_flag(final_re_process) = 1;
 
     %save it
     new_filename_rqmat = strrep(filename_rq , '.rq' , '_comb_chop.rq.mat');
@@ -283,6 +382,6 @@ if ~isempty(re_process) % a pulse in event is long
 
     fprintf('Done!\n') 
 end % if re_process is empty
-re_process
+%final_re_process
 %exit
 end
